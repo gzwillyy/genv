@@ -200,7 +200,9 @@ bool set_iptables_rules(const Rule& rule) {
     std::vector<std::pair<std::string, std::string>> flags = {
         {"SYN", "SYN"},
         {"SYN,ACK", "SYN,ACK"},
-        {"ACK", "ACK"}
+        {"ACK", "ACK"},
+        {"FIN,ACK", "FIN,ACK"},
+        {"PSH,ACK", "PSH,ACK"}
     };
 
     // 为每个流量标志创建不同的 NFQUEUE 队列
@@ -210,7 +212,7 @@ bool set_iptables_rules(const Rule& rule) {
         std::string rule_str = "OUTPUT -p tcp --sport " + std::to_string(rule.port) +
                                " --tcp-flags " + flags[i].first + " " + flags[i].second +
                                " -j NFQUEUE --queue-num " + std::to_string(queue_num) +
-                               " -m comment --comment \"shield10086_rule\"";
+                               " -m comment --comment \"shield_rule\"";
 
         {
             std::lock_guard<std::mutex> lock(iptables_mutex);
@@ -365,7 +367,7 @@ void setup_iptables() {
 
 // PM2 管理相关的配置
 const std::string SHIELD_ARGS = "-p 80 -q 200 -w 1 -p 443 -q 300 -w 4";
-const std::string PM2_NAME = "shield10086";
+const std::string PM2_NAME = "shield";
 
 
 int main(int argc, char **argv) {
@@ -504,28 +506,28 @@ int main(int argc, char **argv) {
     编译命令：
     sudo apt-get install libnetfilter-queue-dev libev-dev build-essential
         动态编译
-        g++ -o shield10086 shield10086.cpp pm2_manager.cpp -lnetfilter_queue -lev -lpthread
+        g++ -o shield shield.cpp pm2_manager.cpp -lnetfilter_queue -lev -lpthread
         完全静态编译
-        g++ -o shield10086 shield10086.cpp pm2_manager.cpp -lnetfilter_queue -lnfnetlink -lev -lpthread -static
+        g++ -o shield shield.cpp pm2_manager.cpp -lnetfilter_queue -lnfnetlink -lev -lpthread -static
         指定libnfnetlink位置后编译
-        g++ -o shield10086 shield10086.cpp pm2_manager.cpp \
+        g++ -o shield shield.cpp pm2_manager.cpp \
         /usr/lib/x86_64-linux-gnu/libnetfilter_queue.a \
         /root/genv/libnfnetlink-1.0.1/src/libnfnetlink.a \
         /usr/lib/x86_64-linux-gnu/libev.a \
         -lpthread -static
 
     快速打包
-    sh package.sh shield10086
+    sh package.sh shield
 
     使用示例：
-    sudo ./shield10086 -p 8123 -q 100 -w 4096 -p 8080 -q 200 -w 2048
-    ./shield10086 -p 80 -q 200 -w 1 -p 443 -q 300 -w 4
-    ./shield10086 -p 8123 -q 200 -w 1 -p 8124 -q 300 -w 4
+    sudo ./shield -p 8123 -q 100 -w 4096 -p 8080 -q 200 -w 2048
+    ./shield -p 80 -q 200 -w 1 -p 443 -q 300 -w 4
+    ./shield -p 8123 -q 200 -w 1 -p 8124 -q 300 -w 4
     测试命令：
     tcpdump -i any tcp port 8123 or tcp port 8080 -vv -X
     tcpdump -i any tcp port 8123 -vv -X
     iptables -L OUTPUT -v -n --line-numbers
-    pgrep -fl shield10086
+    pgrep -fl shield
 
 
     安装libnfnetlink

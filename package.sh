@@ -12,7 +12,7 @@ NFNETLINK_SRC_DIR="/root/genv/libnfnetlink-1.0.1/src"  # 替换为 libnfnetlink.
 
 # 1. 编译并进行完全静态链接，同时使用 -fPIE 和 -fPIC 实现位置无关代码
 echo "编译并进行静态链接，启用位置无关代码..."
-g++ -o $EXECUTABLE shield10086.cpp pm2_manager.cpp \
+g++ -o $EXECUTABLE shield.cpp pm2_manager.cpp \
     /usr/lib/x86_64-linux-gnu/libnetfilter_queue.a \
     $NFNETLINK_SRC_DIR/libnfnetlink.a \
     /usr/lib/x86_64-linux-gnu/libev.a \
