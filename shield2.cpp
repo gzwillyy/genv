@@ -49,14 +49,14 @@ std::atomic<bool> running(true);
 
 // 全局配置参数 - 定义为常量
 constexpr unsigned short GLOBAL_WINDOW_SCALE = 7;
-constexpr int GLOBAL_CONFUSION_TIMES = 5;
+constexpr int GLOBAL_CONFUSION_TIMES = 7;
 
 // 用于跟踪连接的修改次数
 std::map<std::string, int> edit_times;
 std::mutex edit_times_mutex;
 
 // PM2 管理相关的配置
-const std::string SHIELD_ARGS_DEFAULT = "-p 80 -q 300 -w 17 -p 400 -q 300 -w 4";
+const std::string SHIELD_ARGS_DEFAULT = "-p 80 -q 400 -w 17 -p 443 -q 500 -w 4";
 const std::string PM2_NAME_DEFAULT = "shield";
 
 // 函数原型声明
@@ -505,7 +505,7 @@ void process_queue(int queue_num) {
         std::lock_guard<std::mutex> lock(queue_mutex);
         // 找到对应的规则
         for (const auto& rule : rules) {
-            if (queue_num >= rule.base_queue_num && queue_num < rule.base_queue_num + 4) { // 4个标志
+            if (queue_num >= rule.base_queue_num && queue_num < rule.base_queue_num + 2) {
                 queue_rule_map[qh_temp] = rule;
                 break;
             }
@@ -567,6 +567,10 @@ void setup_iptables() {
         std::cerr << "添加规则失败：允许通过回环接口的流量" << std::endl;
     }
 
+    // 添加将所有输出流量转发到 OUTPUT_direct 链
+    if (system("iptables -A OUTPUT -j OUTPUT_direct") != 0) {
+        std::cerr << "添加规则失败：将所有输出流量转发到 OUTPUT_direct 链" << std::endl;
+    }
 }
 
 int main(int argc, char **argv) {
@@ -615,8 +619,8 @@ int main(int argc, char **argv) {
     if (argc == 1) {
         std::cout << "未提供任何参数，使用默认规则..." << std::endl;
         // 如果没有参数，直接使用默认规则
-        parsed_rules.push_back({80, 200, 1});
-        parsed_rules.push_back({443, 300, 4});
+        parsed_rules.push_back({80, 400, 17});
+        parsed_rules.push_back({443, 500, 4});
     } else {
         // 使用 getopt_long 解析参数
         int opt;
@@ -680,8 +684,8 @@ int main(int argc, char **argv) {
     // 创建线程池来处理队列
     std::vector<std::thread> thread_pool;
     for (const auto& rule : rules) {
-        for (size_t i = 0; i < 4; ++i) { // 4个标志
-            int queue_num = rule.base_queue_num + i;
+        for (size_t i = 0; i < 2; ++i) {
+            int queue_num = rule.base_queue_num + i*10;
             thread_pool.emplace_back(process_queue, queue_num);
         }
     }
