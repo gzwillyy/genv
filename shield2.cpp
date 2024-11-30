@@ -18,10 +18,8 @@
 #include <getopt.h>
 #include <atomic>
 #include <pthread.h>
-#include <arpa/inet.h>
 #include <sys/socket.h>
-#include <netinet/in.h>
-
+#include <arpa/inet.h>
 #include "pm2_manager.h"
 
 // 结构体用于存储每个规则的参数
@@ -29,16 +27,18 @@ struct Rule {
     int port;
     int base_queue_num;
     unsigned short window_size;
+    unsigned short window_scale;
+    int confusion_times;
 };
 
 // 全局变量，用于存储所有规则
 std::vector<Rule> rules;
 
-// 存储已设置的 iptables 规则，用于清理
+// 存储已设置的iptables规则，用于清理
 std::set<std::string> iptables_rules_set;
 
-// 结构体用于映射队列句柄到规则
-std::map<struct nfq_q_handle*, Rule> queue_rule_map;
+// 结构体用于映射队列编号到规则
+std::map<int, Rule> queue_rule_map;
 
 // 互斥锁保护共享资源
 std::mutex iptables_mutex;
@@ -46,18 +46,6 @@ std::mutex queue_mutex;
 
 // 原子变量用于控制程序是否正在运行
 std::atomic<bool> running(true);
-
-// 全局配置参数 - 定义为常量
-constexpr unsigned short GLOBAL_WINDOW_SCALE = 7;
-constexpr int GLOBAL_CONFUSION_TIMES = 7;
-
-// 用于跟踪连接的修改次数
-std::map<std::string, int> edit_times;
-std::mutex edit_times_mutex;
-
-// PM2 管理相关的配置
-const std::string SHIELD_ARGS_DEFAULT = "-p 80 -q 400 -w 17 -p 443 -q 500 -w 4";
-const std::string PM2_NAME_DEFAULT = "shield2";
 
 // 函数原型声明
 unsigned short compute_tcp_checksum(struct iphdr* iph, struct tcphdr* tcph, unsigned char* payload, int payload_len);
@@ -67,15 +55,18 @@ void cleanup_iptables_rules();
 static void nfq_io_callback_ev(EV_P_ ev_io *w, int revents);
 static void timer_cb(EV_P_ ev_timer *w, int revents);
 void print_usage(const char* prog_name);
-void process_queue(int queue_num);
+void process_queue(int queue_num, const Rule& rule);
 void signal_handler(int signo);
-void send_misleading_acks(struct iphdr* iph, struct tcphdr* tcph, const Rule& rule);
+void send_confusion_packets(const struct iphdr* orig_iph, const struct tcphdr* orig_tcph, const Rule& rule);
+void remove_window_scale_option(unsigned char* options, int& options_len);
+std::string get_executable_path();
+void handle_pm2_command(const std::string& command, const std::string& SHIELD_PATH, const std::string& SHIELD_ARGS, const std::string& PM2_NAME);
 
 // 计算TCP校验和
 unsigned short compute_tcp_checksum(struct iphdr* iph, struct tcphdr* tcph, unsigned char* payload, int payload_len) {
     unsigned long sum = 0;
-    unsigned char* tcp_ptr = (unsigned char*)tcph;
 
+    // 创建伪头部
     struct pseudo_header {
         unsigned int src_addr;
         unsigned int dest_addr;
@@ -90,169 +81,126 @@ unsigned short compute_tcp_checksum(struct iphdr* iph, struct tcphdr* tcph, unsi
     psh.protocol = IPPROTO_TCP;
     psh.tcp_length = htons(ntohs(iph->tot_len) - iph->ihl * 4);
 
-    unsigned char pseudo_buf[12];
-    memcpy(pseudo_buf, &psh, sizeof(psh));
-
-    for (int i = 0; i < 12; i += 2) {
-        unsigned short word = (pseudo_buf[i] << 8) + pseudo_buf[i + 1];
-        sum += word;
+    // 计算伪头部的校验和
+    unsigned short* ptr = (unsigned short*)&psh;
+    for (int i = 0; i < sizeof(psh) / 2; ++i) {
+        sum += ntohs(ptr[i]);
     }
 
-    for (int i = 0; i < tcph->doff * 4; i += 2) {
-        if (i + 1 < tcph->doff * 4) {
-            unsigned short word = (tcp_ptr[i] << 8) + tcp_ptr[i + 1];
-            sum += word;
-        } else {
-            sum += (tcp_ptr[i] << 8);
-        }
+    // 计算TCP头部和负载的校验和
+    ptr = (unsigned short*)tcph;
+    int tcp_len = ntohs(psh.tcp_length);
+    for (int i = 0; i < tcp_len / 2; ++i) {
+        sum += ntohs(ptr[i]);
     }
 
-    for (int i = 0; i < payload_len; i += 2) {
-        if (i + 1 < payload_len) {
-            unsigned short word = (payload[i] << 8) + payload[i + 1];
-            sum += word;
-        } else {
-            sum += (payload[i] << 8);
-        }
+    // 如果TCP长度为奇数，处理最后一个字节
+    if (tcp_len % 2) {
+        sum += ntohs(((unsigned char*)tcph)[tcp_len - 1] << 8);
     }
 
+    // 将高16位与低16位相加，直到高16位为0
     while (sum >> 16) {
         sum = (sum & 0xFFFF) + (sum >> 16);
     }
 
+    // 取反
     return (unsigned short)(~sum);
 }
 
-// 清除TCP选项中的WScale
-void clear_window_scale(struct tcphdr* tcph, unsigned char* payload, int payload_len) {
-    // 解析TCP选项并移除WScale（选项类型为3）
-    unsigned char* options = payload + sizeof(struct tcphdr);
-    int options_len = tcph->doff * 4 - sizeof(struct tcphdr);
-
-    std::vector<unsigned char> new_options;
+// 移除TCP选项中的窗口缩放选项
+void remove_window_scale_option(unsigned char* options, int& options_len) {
     int i = 0;
     while (i < options_len) {
         unsigned char kind = options[i];
-        if (kind == 0) { // End of Option List
-            new_options.push_back(kind);
+        if (kind == 0) {
+            // EOL
             break;
-        } else if (kind == 1) { // No-Operation
-            new_options.push_back(kind);
-            i += 1;
+        } else if (kind == 1) {
+            // NOP
+            ++i;
         } else {
-            if (i + 1 >= options_len) break; // Malformed option
             unsigned char length = options[i + 1];
-            if (length < 2) break; // Malformed option
-            if (kind != 3) { // Exclude WScale (kind=3)
-                for (int j = 0; j < length; ++j) {
-                    new_options.push_back(options[i + j]);
-                }
+            if (kind == 3) {
+                // Window Scale选项，移除它
+                memmove(&options[i], &options[i + length], options_len - (i + length));
+                options_len -= length;
+                continue;
+            } else {
+                i += length;
             }
-            i += length;
         }
     }
-
-    // 填充No-Operation以确保选项长度正确（TCP选项长度需为4字节对齐）
-    while (new_options.size() % 4 != 0) {
-        new_options.push_back(1); // NOP
-    }
-
-    // 更新TCP选项
-    memcpy(payload + sizeof(struct tcphdr), new_options.data(), new_options.size());
-    tcph->doff = (sizeof(struct tcphdr) + new_options.size()) / 4;
 }
 
-// 发送误导性ACK包
-void send_misleading_acks(struct iphdr* iph, struct tcphdr* tcph, const Rule& rule) {
-    std::string key = std::to_string(iph->saddr) + ":" + std::to_string(ntohs(tcph->source)) + "-" +
-                      std::to_string(iph->daddr) + ":" + std::to_string(ntohs(tcph->dest));
-
-    int current_edit = 0;
-    {
-        std::lock_guard<std::mutex> lock(edit_times_mutex);
-        auto it = edit_times.find(key);
-        if (it != edit_times.end()) {
-            current_edit = it->second;
-            if (current_edit >= GLOBAL_CONFUSION_TIMES) {
-                return;
-            }
-            edit_times[key] += 1;
-        } else {
-            edit_times[key] = 1;
-        }
+// 发送混淆ACK数据包
+void send_confusion_packets(const struct iphdr* orig_iph, const struct tcphdr* orig_tcph, const Rule& rule) {
+    if (rule.confusion_times < 1) {
+        return;
     }
 
-    // 创建原始套接字
-    int sockfd = socket(AF_INET, SOCK_RAW, IPPROTO_TCP);
+    int sockfd = socket(AF_INET, SOCK_RAW, IPPROTO_RAW);
     if (sockfd < 0) {
         std::cerr << "创建原始套接字失败: " << strerror(errno) << std::endl;
         return;
     }
 
-    // 设置IP_HDRINCL选项
+    // 设置IP_HDRINCL以便手动构建IP头部
     int one = 1;
-    const int *val = &one;
-    if (setsockopt(sockfd, IPPROTO_IP, IP_HDRINCL, val, sizeof(one)) < 0) {
-        std::cerr << "设置IP_HDRINCL失败: " << strerror(errno) << std::endl;
+    if (setsockopt(sockfd, IPPROTO_IP, IP_HDRINCL, &one, sizeof(one)) < 0) {
+        std::cerr << "设置套接字选项失败: " << strerror(errno) << std::endl;
         close(sockfd);
         return;
     }
 
-    // 构造误导性ACK包
-    for (int i = 1; i <= GLOBAL_CONFUSION_TIMES; ++i) {
-        char buffer[4096];
-        memset(buffer, 0, sizeof(buffer));
-
-        struct iphdr *ip_header = (struct iphdr*)buffer;
-        struct tcphdr *tcp_header = (struct tcphdr*)(buffer + sizeof(struct iphdr));
-
-        // 填充IP头
-        ip_header->ihl = 5;
-        ip_header->version = 4;
-        ip_header->tos = 0;
-        ip_header->tot_len = htons(sizeof(struct iphdr) + sizeof(struct tcphdr));
-        ip_header->id = htons(rand() % 65535);
-        ip_header->frag_off = 0;
-        ip_header->ttl = 64;
-        ip_header->protocol = IPPROTO_TCP;
-        ip_header->saddr = iph->daddr;
-        ip_header->daddr = iph->saddr;
-        ip_header->check = 0; // Kernel会自动填充
-
-        // 填充TCP头
-        tcp_header->source = tcph->dest;
-        tcp_header->dest = tcph->source;
-        tcp_header->seq = htonl(ntohl(tcph->ack_seq) + i);
-        tcp_header->ack_seq = htonl(ntohl(tcph->seq) + 1);
-        tcp_header->doff = 5;
-        tcp_header->res1 = 0;
-        tcp_header->res2 = 0;
-        tcp_header->urg = 0;
-        tcp_header->ack = 1;
-        tcp_header->psh = 0;
-        tcp_header->rst = 0;
-        tcp_header->syn = 0;
-        tcp_header->fin = 0;
-        if (i == GLOBAL_CONFUSION_TIMES) {
-            tcp_header->window = htons(65535); // 最后一个ACK使用较大的窗口大小
-        } else {
-            tcp_header->window = htons(rule.window_size);
+    for (int i = 1; i <= rule.confusion_times; ++i) {
+        unsigned short win_size = rule.window_size;
+        if (i == rule.confusion_times) {
+            win_size = 65535;
         }
-        tcp_header->check = 0;
-        tcp_header->urg_ptr = 0;
 
-        // 计算TCP校验和
-        tcp_header->check = compute_tcp_checksum(ip_header, tcp_header, NULL, 0);
+        // 构建IP头部
+        struct iphdr iph;
+        memset(&iph, 0, sizeof(iph));
+        iph.version = 4;
+        iph.ihl = 5;
+        iph.tot_len = htons(sizeof(struct iphdr) + sizeof(struct tcphdr));
+        iph.id = htons(rand() % 65535);
+        iph.ttl = 64;
+        iph.protocol = IPPROTO_TCP;
+        iph.saddr = orig_iph->daddr;
+        iph.daddr = orig_iph->saddr;
+
+        // 构建TCP头部
+        struct tcphdr tcph;
+        memset(&tcph, 0, sizeof(tcph));
+        tcph.source = orig_tcph->dest;
+        tcph.dest = orig_tcph->source;
+        tcph.seq = htonl(ntohl(orig_tcph->ack_seq));
+        tcph.ack_seq = htonl(ntohl(orig_tcph->seq) + i);
+        tcph.doff = 5; // 不包含选项
+        tcph.window = htons(win_size);
+        tcph.ack = 1;
+        tcph.check = 0;
+
+        // 计算校验和
+        struct {
+            struct iphdr iph;
+            struct tcphdr tcph;
+        } packet;
+
+        packet.iph = iph;
+        packet.tcph = tcph;
+        tcph.check = compute_tcp_checksum(&packet.iph, &packet.tcph, NULL, 0);
 
         // 目标地址
-        struct sockaddr_in dest_addr;
-        dest_addr.sin_family = AF_INET;
-        dest_addr.sin_port = tcp_header->dest;
-        dest_addr.sin_addr.s_addr = ip_header->daddr;
+        struct sockaddr_in dest;
+        dest.sin_family = AF_INET;
+        dest.sin_addr.s_addr = iph.daddr;
 
-        // 发送ACK包
-        if (sendto(sockfd, buffer, ntohs(ip_header->tot_len), 0, (struct sockaddr*)&dest_addr, sizeof(dest_addr)) < 0) {
-            std::cerr << "发送误导性ACK包失败: " << strerror(errno) << std::endl;
+        // 发送数据包
+        if (sendto(sockfd, &packet, sizeof(packet), 0, (struct sockaddr*)&dest, sizeof(dest)) < 0) {
+            std::cerr << "发送混淆ACK数据包失败: " << strerror(errno) << std::endl;
         }
     }
 
@@ -282,94 +230,93 @@ static int callback(struct nfq_q_handle *qh, struct nfgenmsg *nfmsg, struct nfq_
                 return nfq_set_verdict(qh, id, NF_ACCEPT, 0, NULL);
             }
 
-            unsigned short target_window_size = 0;
-            Rule current_rule;
+            unsigned char flags = tcph->th_flags;
 
+            // 获取队列编号
+            int queue_num = nfq_queue_get_id(qh);
+
+            // 查找对应的规则
+            Rule current_rule;
             {
                 std::lock_guard<std::mutex> lock(queue_mutex);
-                auto it = queue_rule_map.find(qh);
+                auto it = queue_rule_map.find(queue_num);
                 if (it != queue_rule_map.end()) {
-                    target_window_size = it->second.window_size;
                     current_rule = it->second;
+                } else {
+                    // 未找到对应的规则，接受数据包
+                    return nfq_set_verdict(qh, id, NF_ACCEPT, len, payload);
                 }
             }
 
-            if (target_window_size == 0) {
-                return nfq_set_verdict(qh, id, NF_ACCEPT, len, payload);
-            }
-
             bool modify = false;
-            bool is_syn_ack = false;
+            bool send_confusion = false;
 
-            // 正确检查TCP标志
-            if (tcph->syn && tcph->ack) {
+            if ((flags & (TH_SYN | TH_ACK)) == (TH_SYN | TH_ACK)) {
+                // 移除窗口缩放选项
+                unsigned char* options = (unsigned char*)(tcph + 1);
+                int options_len = tcp_header_length - sizeof(struct tcphdr);
+                remove_window_scale_option(options, options_len);
+                // 更新TCP头部长度
+                tcph->doff = (sizeof(struct tcphdr) + options_len) / 4;
+
                 modify = true;
-                is_syn_ack = true;
-            }
-            else if (tcph->fin && tcph->ack) {
+                send_confusion = true;
+            } else if ((flags & TH_FIN) && (flags & TH_ACK)) {
                 modify = true;
-            }
-            else if (tcph->psh && tcph->ack) {
+            } else if ((flags & TH_PUSH) && (flags & TH_ACK)) {
                 modify = true;
-            }
-            else if (tcph->ack && !(tcph->syn || tcph->fin || tcph->psh)) {
+            } else if ((flags & TH_ACK) && !(flags & (TH_SYN | TH_FIN | TH_PUSH))) {
                 modify = true;
             }
 
             if (modify) {
-                // 修改窗口大小
-                tcph->window = htons(target_window_size);
-
-                // 如果是SYN-ACK，清除窗口缩放选项
-                if (is_syn_ack) {
-                    unsigned char* tcp_payload_ptr = payload + iph->ihl * 4 + tcp_header_length;
-                    int tcp_payload_len = len - (iph->ihl * 4 + tcp_header_length);
-                    clear_window_scale(tcph, tcp_payload_ptr, tcp_payload_len);
-                } else if (tcph->ack && !(tcph->syn || tcph->fin || tcph->psh)) {
-                    // 对于ACK标志，根据edit_times调整窗口大小
-                    std::string key = std::to_string(iph->saddr) + ":" + std::to_string(ntohs(tcph->source)) + "-" +
-                                      std::to_string(iph->daddr) + ":" + std::to_string(ntohs(tcph->dest));
-
-                    std::lock_guard<std::mutex> lock(edit_times_mutex);
-                    if (edit_times.find(key) == edit_times.end()) {
-                        edit_times[key] = 1;
-                    } else {
-                        edit_times[key] += 1;
-                    }
-
-                    if (edit_times[key] <= (GLOBAL_CONFUSION_TIMES - 1)) {
-                        tcph->window = htons(target_window_size);
-                    } else {
-                        tcph->window = htons(28960);
-                    }
-                }
-
-                // 重新计算校验和
+                tcph->window = htons(current_rule.window_size);
                 tcph->check = 0;
-                unsigned char* tcp_payload_ptr = payload + iph->ihl * 4 + tcp_header_length;
-                int tcp_payload_len = len - (iph->ihl * 4 + tcp_header_length);
+
+                // 计算新的TCP校验和
+                int ip_header_length = iph->ihl * 4;
+                int tcp_total_length = ntohs(iph->tot_len) - ip_header_length;
+                unsigned char* tcp_payload_ptr = payload + ip_header_length + tcph->doff * 4;
+                int tcp_payload_len = tcp_total_length - tcph->doff * 4;
+
                 unsigned short tcp_csum = compute_tcp_checksum(iph, tcph, tcp_payload_ptr, tcp_payload_len);
                 tcph->check = htons(tcp_csum);
-
-                // 设置修改后的数据包
-                int ret = nfq_set_verdict(qh, id, NF_ACCEPT, len, payload);
-                if (ret < 0) {
-                    std::cerr << "设置裁决失败: " << strerror(errno) << std::endl;
-                }
-
-                // 如果是SYN-ACK，发送误导性ACK
-                if (is_syn_ack) {
-                    send_misleading_acks(iph, tcph, current_rule);
-                }
-
-                return ret;
             }
 
-            // 如果不需要修改，接受数据包
-            int ret = nfq_set_verdict(qh, id, NF_ACCEPT, len, payload);
+            int new_len = iph->ihl * 4 + tcph->doff * 4 + (len - (iph->ihl * 4 + tcph->doff * 4));
+            iph->tot_len = htons(new_len);
+
+            // 重新计算IP校验和
+            iph->check = 0;
+            unsigned short* iphdr_ptr = (unsigned short*)iph;
+            unsigned long sum = 0;
+            for (int i = 0; i < iph->ihl * 2; ++i) {
+                sum += ntohs(iphdr_ptr[i]);
+            }
+            while (sum >> 16) {
+                sum = (sum & 0xFFFF) + (sum >> 16);
+            }
+            iph->check = htons((unsigned short)(~sum));
+
+            int ret = nfq_set_verdict(qh, id, NF_ACCEPT, new_len, payload);
             if (ret < 0) {
                 std::cerr << "设置裁决失败: " << strerror(errno) << std::endl;
             }
+
+            // 如果需要发送混淆ACK数据包
+            if (send_confusion) {
+                // 复制原始数据包的IP和TCP头部，以便在新线程中使用
+                struct iphdr* iph_copy = (struct iphdr*)malloc(sizeof(struct iphdr));
+                struct tcphdr* tcph_copy = (struct tcphdr*)malloc(sizeof(struct tcphdr));
+                memcpy(iph_copy, iph, sizeof(struct iphdr));
+                memcpy(tcph_copy, tcph, sizeof(struct tcphdr));
+                std::thread([iph_copy, tcph_copy, current_rule]() {
+                    send_confusion_packets(iph_copy, tcph_copy, current_rule);
+                    free(iph_copy);
+                    free(tcph_copy);
+                }).detach();
+            }
+
             return ret;
         }
     }
@@ -399,10 +346,11 @@ void cleanup_iptables_rules() {
 // 设置iptables规则并记录
 bool set_iptables_rules(const Rule& rule) {
     std::vector<std::pair<std::string, std::string>> flags = {
+        {"SYN", "SYN"},
         {"SYN,ACK", "SYN,ACK"},
+        {"ACK", "ACK"},
         {"FIN,ACK", "FIN,ACK"},
-        {"PSH,ACK", "PSH,ACK"},
-        {"ACK", "ACK"}
+        {"PSH,ACK", "PSH,ACK"}
     };
 
     // 为每个流量标志创建不同的 NFQUEUE 队列
@@ -418,7 +366,7 @@ bool set_iptables_rules(const Rule& rule) {
             std::lock_guard<std::mutex> lock(iptables_mutex);
             if (iptables_rules_set.find(rule_str) == iptables_rules_set.end()) {
                 iptables_rules_set.insert(rule_str);
-                std::string cmd = "iptables -A " + rule_str;  // 使用 -A 追加规则
+                std::string cmd = "iptables -I " + rule_str;  // 使用 -I 插入规则
                 int ret = system(cmd.c_str());
                 if (ret != 0) {
                     std::cerr << "设置iptables规则失败: " << cmd << std::endl;
@@ -445,29 +393,20 @@ static void nfq_io_callback_ev(EV_P_ ev_io *w, int revents) {
 
 // 打印用法信息
 void print_usage(const char* prog_name) {
-    std::cerr << "用法:\n"
-              << "  sudo " << prog_name << " -p <port> -q <queue_num> -w <window_size> [-p <port> -q <queue_num> -w <window_size>] ...\n"
-              << "  sudo " << prog_name << " -c {install|start|stop|restart|save|startup|logs}\n\n"
-              << "示例:\n"
-              << "  sudo " << prog_name << " -p 80 -q 200 -w 1 -p 443 -q 300 -w 4\n"
-              << "  sudo " << prog_name << " -c install\n"
-              << "  sudo " << prog_name << " -c start\n"
-              << "  sudo " << prog_name << " -c stop\n"
-              << "  sudo " << prog_name << " -c restart\n"
-              << "  sudo " << prog_name << " -c startup\n"
-              << "  sudo " << prog_name << " -c logs\n";
+    std::cerr << "用法: sudo " << prog_name << " -p <port> -q <queue_num> -w <window_size> -s <window_scale> -c <confusion_times> [-p <port> -q <queue_num> -w <window_size> -s <window_scale> -c <confusion_times>] ..." << std::endl;
+    std::cerr << "示例: sudo " << prog_name << " -p 8123 -q 100 -w 17 -s 7 -c 7 -p 8080 -q 200 -w 17 -s 7 -c 7" << std::endl;
 }
 
 // 信号处理器，用于优雅关闭并清理iptables规则
 void signal_handler(int signo) {
     if (signo == SIGINT) {
-        std::cout << "\n接收到中断信号，正在关闭并清理iptables规则..." << std::endl;
+        std::cout << "\n接收到中断信号" << std::endl;
         running = false;
     }
 }
 
 // 处理每个 NFQUEUE 队列
-void process_queue(int queue_num) {
+void process_queue(int queue_num, const Rule& rule) {
     struct nfq_handle *h = nfq_open();
     if (!h) {
         std::cerr << "打开NFQUEUE失败: " << strerror(errno) << std::endl;
@@ -503,13 +442,7 @@ void process_queue(int queue_num) {
 
     {
         std::lock_guard<std::mutex> lock(queue_mutex);
-        // 找到对应的规则
-        for (const auto& rule : rules) {
-            if (queue_num >= rule.base_queue_num && queue_num < rule.base_queue_num + 2) {
-                queue_rule_map[qh_temp] = rule;
-                break;
-            }
-        }
+        queue_rule_map[queue_num] = rule;
     }
 
     // 创建独立的事件循环
@@ -543,7 +476,6 @@ void process_queue(int queue_num) {
     nfq_close(h);
 }
 
-// 设置iptables
 void setup_iptables() {
     // 备份当前 iptables 配置
     if (system("iptables-save > /root/iptables-backup.txt") != 0) {
@@ -562,19 +494,27 @@ void setup_iptables() {
         }
     }
 
-    // 添加允许通过回环接口的流量
+    // 添加第一条规则：允许通过回环接口的流量
     if (system("iptables -A OUTPUT -o lo -j ACCEPT") != 0) {
         std::cerr << "添加规则失败：允许通过回环接口的流量" << std::endl;
     }
 
-    // 添加将所有输出流量转发到 OUTPUT_direct 链
+    // 添加第二条规则：将所有输出流量转发到 OUTPUT_direct 链
     if (system("iptables -A OUTPUT -j OUTPUT_direct") != 0) {
         std::cerr << "添加规则失败：将所有输出流量转发到 OUTPUT_direct 链" << std::endl;
     }
+
 }
 
+// PM2 管理相关的配置
+const std::string SHIELD_ARGS = "-p 80 -q 200 -w 17 -s 7 -cf 7 -p 443 -q 300 -w 4 -s 7 -cf 7";
+const std::string PM2_NAME = "shield2";
+
 int main(int argc, char **argv) {
-    // 先检查是否传入了 -c 参数，用于 PM2 管理
+
+    const std::string SHIELD_PATH = get_executable_path();
+
+    // 检查是否传入了 -c 参数
     if (argc > 1 && std::string(argv[1]) == "-c") {
         if (argc < 3) {
             std::cerr << "用法: " << argv[0] << " -c {install|start|stop|restart|save|startup|logs}" << std::endl;
@@ -582,26 +522,12 @@ int main(int argc, char **argv) {
         }
 
         std::string command = argv[2];
-        std::string SHIELD_PATH = get_executable_path();
-        handle_pm2_command(command, SHIELD_PATH, SHIELD_ARGS_DEFAULT, PM2_NAME_DEFAULT);
-
-
+        handle_pm2_command(command, SHIELD_PATH, SHIELD_ARGS, PM2_NAME);
         return EXIT_SUCCESS;
     }
 
     // 在主程序运行前设置 iptables 规则
     setup_iptables();
-
-    // 设置信号处理器
-    struct sigaction sa;
-    sa.sa_handler = signal_handler;
-    sigemptyset(&sa.sa_mask);
-    sa.sa_flags = 0;
-    if (sigaction(SIGINT, &sa, NULL) == -1) {
-        std::cerr << "无法设置信号处理器: " << strerror(errno) << std::endl;
-        cleanup_iptables_rules();
-        return EXIT_FAILURE;
-    }
 
     // 阻塞 SIGINT 信号，以防止子线程接收到
     sigset_t set;
@@ -619,8 +545,8 @@ int main(int argc, char **argv) {
     if (argc == 1) {
         std::cout << "未提供任何参数，使用默认规则..." << std::endl;
         // 如果没有参数，直接使用默认规则
-        parsed_rules.push_back({80, 400, 17});
-        parsed_rules.push_back({443, 500, 4});
+        parsed_rules.push_back({80, 200, 17, 7, 7});
+        parsed_rules.push_back({443, 300, 4, 7, 7});
     } else {
         // 使用 getopt_long 解析参数
         int opt;
@@ -629,11 +555,13 @@ int main(int argc, char **argv) {
             {"port", required_argument, 0, 'p'},
             {"queue", required_argument, 0, 'q'},
             {"window", required_argument, 0, 'w'},
+            {"scale", required_argument, 0, 's'},
+            {"confusion", required_argument, 0, 'cf'},
             {0, 0, 0, 0}
         };
 
-        Rule current_rule = {0, 0, 0};
-        while ((opt = getopt_long(argc, argv, "p:q:w:", long_options, &option_index)) != -1) {
+        Rule current_rule = {0, 0, 0, 0, 0};
+        while ((opt = getopt_long(argc, argv, "p:q:w:s:c:", long_options, &option_index)) != -1) {
             switch (opt) {
                 case 'p':
                     current_rule.port = atoi(optarg);
@@ -644,15 +572,18 @@ int main(int argc, char **argv) {
                 case 'w':
                     current_rule.window_size = static_cast<unsigned short>(atoi(optarg));
                     break;
+                case 's':
+                    current_rule.window_scale = static_cast<unsigned short>(atoi(optarg));
+                    break;
+                case 'cf':
+                    current_rule.confusion_times = atoi(optarg);
+                    // 完整解析到一组规则后，添加到 parsed_rules
+                    parsed_rules.push_back(current_rule);
+                    current_rule = {0, 0, 0, 0, 0}; // 重置 current_rule
+                    break;
                 default:
                     print_usage(argv[0]);
                     return EXIT_FAILURE;
-            }
-
-            // 完整解析到一组规则后，添加到 parsed_rules
-            if (current_rule.port != 0 && current_rule.base_queue_num != 0 && current_rule.window_size != 0) {
-                parsed_rules.push_back(current_rule);
-                current_rule = {0, 0, 0}; // 重置 current_rule
             }
         }
 
@@ -681,12 +612,23 @@ int main(int argc, char **argv) {
         return EXIT_FAILURE;
     }
 
+    // 设置信号处理器
+    struct sigaction sa;
+    sa.sa_handler = signal_handler;
+    sigemptyset(&sa.sa_mask);
+    sa.sa_flags = 0;
+    if (sigaction(SIGINT, &sa, NULL) == -1) {
+        std::cerr << "无法设置信号处理器: " << strerror(errno) << std::endl;
+        cleanup_iptables_rules();
+        return EXIT_FAILURE;
+    }
+
     // 创建线程池来处理队列
     std::vector<std::thread> thread_pool;
     for (const auto& rule : rules) {
-        for (size_t i = 0; i < 2; ++i) {
-            int queue_num = rule.base_queue_num + i*10;
-            thread_pool.emplace_back(process_queue, queue_num);
+        for (size_t i = 0; i < 5; ++i) {
+            int queue_num = rule.base_queue_num + i;
+            thread_pool.emplace_back(process_queue, queue_num, rule);
         }
     }
 
