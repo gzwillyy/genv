@@ -76,7 +76,7 @@ void handle_pm2_command(const std::string &command, const std::string &shield_pa
     }
 
     if (!is_pm2_installed()) {
-        std::cerr << "PM2 未安装，请先运行 'shield10086 -c install'" << std::endl;
+        std::cerr << "PM2 未安装，请先运行 'shield -c install'" << std::endl;
         exit(1);
     }
 

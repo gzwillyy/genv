@@ -47,9 +47,9 @@ std::mutex queue_mutex;
 // 原子变量用于控制程序是否正在运行
 std::atomic<bool> running(true);
 
-// 全局配置参数
-unsigned short global_window_scale = 7;
-int global_confusion_times = 7;
+// 全局配置参数 - 定义为常量
+constexpr unsigned short GLOBAL_WINDOW_SCALE = 7;
+constexpr int GLOBAL_CONFUSION_TIMES = 7;
 
 // 用于跟踪连接的修改次数
 std::map<std::string, int> edit_times;
@@ -173,7 +173,7 @@ void send_misleading_acks(struct iphdr* iph, struct tcphdr* tcph, const Rule& ru
         auto it = edit_times.find(key);
         if (it != edit_times.end()) {
             current_edit = it->second;
-            if (current_edit >= global_confusion_times) {
+            if (current_edit >= GLOBAL_CONFUSION_TIMES) {
                 return;
             }
             edit_times[key] += 1;
@@ -199,7 +199,7 @@ void send_misleading_acks(struct iphdr* iph, struct tcphdr* tcph, const Rule& ru
     }
 
     // 构造误导性ACK包
-    for (int i = 1; i <= global_confusion_times; ++i) {
+    for (int i = 1; i <= GLOBAL_CONFUSION_TIMES; ++i) {
         char buffer[4096];
         memset(buffer, 0, sizeof(buffer));
 
@@ -233,7 +233,7 @@ void send_misleading_acks(struct iphdr* iph, struct tcphdr* tcph, const Rule& ru
         tcp_header->rst = 0;
         tcp_header->syn = 0;
         tcp_header->fin = 0;
-        if (i == global_confusion_times) {
+        if (i == GLOBAL_CONFUSION_TIMES) {
             tcp_header->window = htons(65535); // 最后一个ACK使用较大的窗口大小
         } else {
             tcp_header->window = htons(rule.window_size);
@@ -337,7 +337,7 @@ static int callback(struct nfq_q_handle *qh, struct nfgenmsg *nfmsg, struct nfq_
                         edit_times[key] += 1;
                     }
 
-                    if (edit_times[key] <= 6) {
+                    if (edit_times[key] <= (GLOBAL_CONFUSION_TIMES - 1)) {
                         tcph->window = htons(target_window_size);
                     } else {
                         tcph->window = htons(28960);
@@ -629,13 +629,11 @@ int main(int argc, char **argv) {
             {"port", required_argument, 0, 'p'},
             {"queue", required_argument, 0, 'q'},
             {"window", required_argument, 0, 'w'},
-            {"scale", required_argument, 0, 's'},
-            {"confusion", required_argument, 0, 'c'},
             {0, 0, 0, 0}
         };
 
         Rule current_rule = {0, 0, 0};
-        while ((opt = getopt_long(argc, argv, "p:q:w:s:c:", long_options, &option_index)) != -1) {
+        while ((opt = getopt_long(argc, argv, "p:q:w:", long_options, &option_index)) != -1) {
             switch (opt) {
                 case 'p':
                     current_rule.port = atoi(optarg);
@@ -645,12 +643,6 @@ int main(int argc, char **argv) {
                     break;
                 case 'w':
                     current_rule.window_size = static_cast<unsigned short>(atoi(optarg));
-                    break;
-                case 's':
-                    global_window_scale = static_cast<unsigned short>(atoi(optarg));
-                    break;
-                case 'c':
-                    global_confusion_times = atoi(optarg);
                     break;
                 default:
                     print_usage(argv[0]);
