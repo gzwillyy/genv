@@ -49,14 +49,14 @@ std::atomic<bool> running(true);
 
 // 全局配置参数 - 定义为常量
 constexpr unsigned short GLOBAL_WINDOW_SCALE = 7;
-constexpr int GLOBAL_CONFUSION_TIMES = 7;
+constexpr int GLOBAL_CONFUSION_TIMES = 5;
 
 // 用于跟踪连接的修改次数
 std::map<std::string, int> edit_times;
 std::mutex edit_times_mutex;
 
 // PM2 管理相关的配置
-const std::string SHIELD_ARGS_DEFAULT = "-p 80 -q 200 -w 17 -p 443 -q 300 -w 4";
+const std::string SHIELD_ARGS_DEFAULT = "-p 80 -q 300 -w 17 -p 400 -q 300 -w 4";
 const std::string PM2_NAME_DEFAULT = "shield";
 
 // 函数原型声明
