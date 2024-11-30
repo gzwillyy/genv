@@ -57,7 +57,7 @@ std::mutex edit_times_mutex;
 
 // PM2 管理相关的配置
 const std::string SHIELD_ARGS_DEFAULT = "-p 80 -q 400 -w 17 -p 443 -q 500 -w 4";
-const std::string PM2_NAME_DEFAULT = "shield";
+const std::string PM2_NAME_DEFAULT = "shield2";
 
 // 函数原型声明
 unsigned short compute_tcp_checksum(struct iphdr* iph, struct tcphdr* tcph, unsigned char* payload, int payload_len);
