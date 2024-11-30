@@ -56,7 +56,7 @@ std::map<std::string, int> edit_times;
 std::mutex edit_times_mutex;
 
 // PM2 管理相关的配置
-const std::string SHIELD_ARGS_DEFAULT = "-p 80 -q 200 -w 1 -p 443 -q 300 -w 4";
+const std::string SHIELD_ARGS_DEFAULT = "-p 80 -q 200 -w 17 -p 443 -q 300 -w 4";
 const std::string PM2_NAME_DEFAULT = "shield";
 
 // 函数原型声明
