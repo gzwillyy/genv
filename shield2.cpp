@@ -567,10 +567,6 @@ void setup_iptables() {
         std::cerr << "添加规则失败：允许通过回环接口的流量" << std::endl;
     }
 
-    // 添加将所有输出流量转发到 OUTPUT_direct 链
-    if (system("iptables -A OUTPUT -j OUTPUT_direct") != 0) {
-        std::cerr << "添加规则失败：将所有输出流量转发到 OUTPUT_direct 链" << std::endl;
-    }
 }
 
 int main(int argc, char **argv) {
